@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import time
 from typing import Any
@@ -129,6 +130,14 @@ class Store:
         self._watermark_offsets: dict[str, dict[str, Any]] = {}
         # 快照存储表（snapshot_mgr → backfill_job 共享）
         self._snapshot_store: dict[str, dict[str, Any]] = {}
+        # 同一快照编号被新版本覆盖前的完整版本归档
+        self._snapshot_versions: dict[str, list[dict[str, Any]]] = {}
+        # 快照核验审计
+        self._snapshot_verifications: list[dict[str, Any]] = []
+        # 回填实际写入的数据批次与按目标表索引的行
+        self._backfill_write_log: list[dict[str, Any]] = []
+        self._backfill_writes: dict[str, list[dict[str, Any]]] = {}
+        self._recovery_records: list[dict[str, Any]] = []
         # 血缘图（lineage → table_format 共享）
         self._lineage_graph: dict[str, list[dict[str, Any]]] = {}
         # 归档清单（cold_archive → retention 共享）
@@ -216,6 +225,40 @@ class Store:
 
     def get_snapshot(self, snap_id: str) -> dict[str, Any] | None:
         return self._snapshot_store.get(snap_id)
+
+    def archive_snapshot_version(self, snap_id: str, data: dict[str, Any]) -> None:
+        """保存同一快照编号的历史完整版本，供恢复时寻找可覆盖区间。"""
+        self._snapshot_versions.setdefault(snap_id, []).append(copy.deepcopy(data))
+
+    def snapshot_versions(self, snap_id: str) -> list[dict[str, Any]]:
+        return list(self._snapshot_versions.get(snap_id, []))
+
+    def all_snapshot_versions(self) -> list[dict[str, Any]]:
+        versions: list[dict[str, Any]] = []
+        for snap_id, data in self._snapshot_store.items():
+            versions.append(data)
+            for archived in self._snapshot_versions.get(snap_id, []):
+                versions.append(archived)
+        return versions
+
+    def append_snapshot_verification(self, record: dict[str, Any]) -> None:
+        record["_ts"] = time.time()
+        self._snapshot_verifications.append(record)
+
+    # ---------- 回填写入与恢复凭证 ----------
+    def append_backfill_write(self, record: dict[str, Any], rows: list[dict[str, Any]] | None = None) -> None:
+        record["_ts"] = time.time()
+        self._backfill_write_log.append(record)
+        target = str(record.get("target_table") or record.get("目标表") or "")
+        if target and rows is not None:
+            self._backfill_writes.setdefault(target, []).extend(copy.deepcopy(rows))
+
+    def backfill_writes_for(self, target_table: str) -> list[dict[str, Any]]:
+        return list(self._backfill_writes.get(target_table, []))
+
+    def append_recovery_record(self, record: dict[str, Any]) -> None:
+        record["_ts"] = time.time()
+        self._recovery_records.append(record)
 
     # ---------- 变更日志 ----------
     def append_changelog(self, entry: dict[str, Any]) -> None:
